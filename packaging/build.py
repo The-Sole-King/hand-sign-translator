@@ -16,13 +16,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
-from sign_reader.app import MODEL_URL  # noqa: E402
+from sign_reader.app import FACE_MODEL_URL, MODEL_URL  # noqa: E402
 
-model = HERE / "assets" / "hand_landmarker.task"
-if not model.exists():
-    model.parent.mkdir(exist_ok=True)
-    print(f"Downloading hand model to {model} ...")
-    urllib.request.urlretrieve(MODEL_URL, model)
+for name, url in (("hand_landmarker.task", MODEL_URL), ("face_landmarker.task", FACE_MODEL_URL)):
+    model = HERE / "assets" / name
+    if not model.exists():
+        model.parent.mkdir(exist_ok=True)
+        print(f"Downloading {name} to {model} ...")
+        urllib.request.urlretrieve(url, model)
 
 for d in ("build", "dist"):
     shutil.rmtree(ROOT / d, ignore_errors=True)

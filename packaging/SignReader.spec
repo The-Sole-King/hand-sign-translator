@@ -9,9 +9,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 HERE = Path(SPECPATH)
 ROOT = HERE.parent
-MODEL = HERE / "assets" / "hand_landmarker.task"
-if not MODEL.exists():
-    raise SystemExit(f"Missing {MODEL}. Run packaging/build.py instead of pyinstaller directly.")
+MODELS = [HERE / "assets" / n for n in ("hand_landmarker.task", "face_landmarker.task")]
+for model in MODELS:
+    if not model.exists():
+        raise SystemExit(f"Missing {model}. Run packaging/build.py instead of pyinstaller directly.")
 
 a = Analysis(
     [str(HERE / "launcher.py")],
@@ -19,7 +20,7 @@ a = Analysis(
     # MediaPipe loads its native library from mediapipe/tasks/c via ctypes,
     # which PyInstaller can't see, so collect it (and its data) explicitly.
     binaries=collect_dynamic_libs("mediapipe"),
-    datas=collect_data_files("mediapipe") + [(str(MODEL), "assets")],
+    datas=collect_data_files("mediapipe") + [(str(m), "assets") for m in MODELS],
     hiddenimports=collect_submodules("mediapipe.tasks.python"),
     excludes=["pytest", "IPython"],
 )

@@ -12,7 +12,7 @@ Download the build for your computer from the repo's **Actions** tab (open the l
 | macOS (Apple Silicon) | `SignReader-macos.zip` | Unzip, drag **SignReader.app** to Applications, then **right-click → Open** the first time (the app isn't signed by Apple). Allow camera access when asked. |
 | Linux | `SignReader-linux.tar.gz` | Extract and double-click **SignReader** (or run `./SignReader`). |
 
-The hand model is built in, so the app works offline. It takes a few seconds to start because it unpacks itself.
+The hand and face models are built in, so the app works offline (except for opening websites). It takes a few seconds to start because it unpacks itself.
 
 ## Run from source
 
@@ -58,11 +58,43 @@ It learns from **your** hands, so train it first:
 | Space / Backspace | Edit the text by keyboard |
 | Enter | Read the text aloud |
 | C | Clear the text |
-| Tab / Esc | Train mode / quit |
+| Tab / Esc | Next mode (read → train → jutsu) / quit |
 
 Samples are saved to `~/.sign_reader/samples.json` after each recording. Copy that file to back up your training or move it to another computer.
 
 **Tips:** letters that look alike (M/N, A/S/T, U/V) need more samples, so record them 2–3 times from slightly different angles. J and Z involve movement, so record their final handshape.
+
+## Jutsu mode: hand-seal combos
+
+Press **Tab** until the panel says **JUTSU**. Now signs don't type. Instead, a short sequence of signs (a "combo", like Naruto hand seals) triggers something:
+
+| Combo | Signs | What happens |
+|---|---|---|
+| Rasengan | **B** then **C** | A swirling ball of chakra appears in your palm and follows your hand for 12 s |
+| Kakashi Mask | **M** then **K** | A cloth mask covers your nose and mouth (sign it again to take it off) |
+| Firefox | **F** then **O** | Opens Firefox |
+
+Make each sign in order, holding it until the bar fills, within 3 seconds of the previous one. Train those letters first (seals you haven't trained show in red). **X** clears effects.
+
+### Your own combos
+
+Press **E** in jutsu mode to open `~/.sign_reader/combos.json`, edit it, save it, then press **R** to reload. Each combo has a name, a list of signs, and **one** action:
+
+```json
+[
+  {"name": "Rasengan",     "signs": ["B", "C"],      "effect": "rasengan"},
+  {"name": "Kakashi Mask", "signs": ["M", "K"],      "effect": "mask"},
+  {"name": "Firefox",      "signs": ["F", "O"],      "open": "firefox"},
+  {"name": "Spotify",      "signs": ["S", "P"],      "open": "spotify"},
+  {"name": "YouTube",      "signs": ["Y", "T", "B"], "url": "https://youtube.com"}
+]
+```
+
+- `effect`: `rasengan` or `mask`
+- `open`: an installed app by name (`firefox`, `spotify`, `notepad`, `calc`, …; on macOS use the app's name, e.g. `"Visual Studio Code"`)
+- `url`: a website, opened in your default browser
+
+Combos can be any length. If one combo is the end of another (`B C` and `A B C`), the longer one wins when you sign it.
 
 ## How it works
 
@@ -75,6 +107,8 @@ Samples are saved to `~/.sign_reader/samples.json` after each recording. Copy th
 |---|---|
 | `sign_reader/core.py` | Features, classifier, debouncing, saving. No camera or GUI code |
 | `sign_reader/app.py` | Camera, MediaPipe, window and keyboard controls |
+| `sign_reader/jutsu.py` | Combo file format and sequence matching. No camera or GUI code |
+| `sign_reader/effects.py` | Rasengan and mask drawing, launching apps and URLs |
 | `tests/test_core.py` | Unit tests: `python -m unittest discover -s tests` |
 | `packaging/` | PyInstaller spec and build script for the double-click app |
 
