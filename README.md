@@ -4,7 +4,7 @@ A desktop program that reads **ASL fingerspelling** from your webcam and types i
 
 ## Get the app (double-click)
 
-Download the build for your computer from the repo's **Actions** tab (open the latest *Sign Reader app* run and scroll to **Artifacts**), or from **Releases** once a version has been published:
+Download the build for your computer from the repo's **Actions** tab (open the latest *Build app* run and scroll to **Artifacts**), or from [**Releases**](../../releases) once a version has been published:
 
 | OS | File | Open it |
 |---|---|---|
@@ -19,7 +19,8 @@ The hand model is built in, so the app works offline. It takes a few seconds to 
 Needs Python 3.9+ and a webcam.
 
 ```bash
-cd sign-reader
+git clone https://github.com/The-Sole-King/hand-sign-translator.git
+cd hand-sign-translator
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -38,7 +39,7 @@ pip install -r requirements.txt pyinstaller
 python packaging/build.py
 ```
 
-The result is in `dist/`: `SignReader.exe` on Windows, `SignReader.app` on macOS, `SignReader` on Linux. `dist/SignReader… --self-test` checks that the build can load the model. The [GitHub Actions workflow](../.github/workflows/sign-reader.yml) does this on all three OSes on every push to `sign-reader/`. Pushing a tag like `sign-reader-v1.0.0` publishes the builds as a Release.
+The result is in `dist/`: `SignReader.exe` on Windows, `SignReader.app` on macOS, `SignReader` on Linux. `dist/SignReader… --self-test` checks that the build can load the model. The [GitHub Actions workflow](.github/workflows/build.yml) does this on all three OSes on every push. Pushing a tag like `v1.0.0` publishes the builds as a Release.
 
 ## Use it
 

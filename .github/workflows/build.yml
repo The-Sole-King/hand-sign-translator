@@ -1,0 +1,79 @@
+# Builds the double-click Sign Reader app for Windows, macOS and Linux.
+# Every run uploads the apps as downloadable artifacts; pushing a tag like
+# `v1.0.0` also publishes them as a GitHub Release.
+name: Build app
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # for publishing releases on tags
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: SignReader-windows.zip
+          - os: macos-latest # Apple Silicon
+            asset: SignReader-macos.zip
+          - os: ubuntu-22.04 # older glibc so it runs on more distros
+            asset: SignReader-linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgles2 python3-tk
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Build app
+        run: python packaging/build.py
+
+      - name: Smoke test the built app
+        run: |
+          case "$RUNNER_OS" in
+            Windows) ./dist/SignReader.exe --self-test ;;
+            macOS)   ./dist/SignReader.app/Contents/MacOS/SignReader --self-test ;;
+            Linux)   ./dist/SignReader --self-test ;;
+          esac
+
+      - name: Package
+        run: |
+          cd dist
+          case "$RUNNER_OS" in
+            Windows) 7z a ../${{ matrix.asset }} SignReader.exe ;;
+            macOS)   ditto -c -k --keepParent SignReader.app ../${{ matrix.asset }} ;;
+            Linux)   tar czf ../${{ matrix.asset }} SignReader ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
