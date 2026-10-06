@@ -31,7 +31,17 @@ from .core import (
     load_samples,
     save_samples,
 )
+from .controls import (
+    FaceGestureDetector,
+    HandMouse,
+    InputBackend,
+    SwipeDetector,
+    head_roll,
+    parse_keys,
+    screen_size,
+)
 from .effects import draw_mask, draw_rasengan, open_app, open_url, palm_center
+from .faces import FaceBook, FaceRecognizer
 from .jutsu import Combo, ComboMatcher, load_combos
 
 MODEL_URL = (
@@ -42,6 +52,10 @@ FACE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+FACE_ID_MODEL_URL = (
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+    "face_recognition_sface/face_recognition_sface_2021dec.onnx"
+)
 DATA_DIR = Path.home() / ".sign_reader"
 # Set when running as a PyInstaller-built app; bundled files live under it.
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else None
@@ -50,6 +64,10 @@ SAMPLE_INTERVAL_S = 0.08
 COUNTDOWN_S = 3.0
 RASENGAN_S = 12.0  # how long a Rasengan lasts
 BANNER_S = 1.6
+RECOGNIZE_EVERY_S = 0.5  # face recognition is throttled; tracking is per frame
+GREET_AFTER_S = 60.0  # greet someone again only after they've been away this long
+ENROLL_SAMPLES = 8
+GREEN = (120, 220, 120)
 
 WINDOW = "Sign Reader"
 CAM_W, CAM_H = 640, 480
@@ -147,17 +165,28 @@ def create_face_landmarker(model_path: Path):
         base_options=_base_options(model_path),
         running_mode=vision.RunningMode.VIDEO,
         num_faces=1,
+        output_face_blendshapes=True,  # expression scores for face gestures
     )
     return vision.FaceLandmarker.create_from_options(options)
 
 
-def self_test(model_path: Path, face_model_path: Path) -> None:
+def self_test(model_path: Path, face_model_path: Path, face_id_model_path: Path) -> None:
     """Load the models and run one detection each, for checking a packaged build."""
     blank = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.zeros((CAM_H, CAM_W, 3), np.uint8))
     with create_landmarker(model_path) as landmarker:
         assert not landmarker.detect_for_video(blank, 0).hand_landmarks
     with create_face_landmarker(face_model_path) as landmarker:
         assert not landmarker.detect_for_video(blank, 0).face_landmarks
+    recognizer = FaceRecognizer(face_id_model_path)
+    face = recognizer.model.feature(np.zeros((112, 112, 3), np.uint8))
+    assert face.size == 128
+    # The mouse/keyboard backend can't be imported without a display, but it
+    # must at least be bundled: look in the PyInstaller archive's module list.
+    backend = {"Windows": "win32", "Darwin": "darwin"}.get(platform.system(), "xorg")
+    if BUNDLE_DIR is not None:
+        bundled = sys.modules["pyimod02_importers"].pyz_archive.toc
+        for module in (f"pynput.keyboard._{backend}", f"pynput.mouse._{backend}"):
+            assert module in bundled, f"{module} is not bundled"
     log("self-test ok")
 
 
@@ -215,12 +244,21 @@ class Recording:
     captured: list = field(default_factory=list)
 
 
-MODES = ("read", "train", "jutsu")
+MODES = ("read", "train", "jutsu", "mouse")
+
+
+@dataclass
+class Enrollment:
+    name: str
+    embeddings: list = field(default_factory=list)
+    last_at: float = 0.0
 
 
 class App:
     def __init__(self, camera: int, samples_path: Path, model_path: Path,
-                 face_model_path: Path, combos_path: Path):
+                 face_model_path: Path, combos_path: Path,
+                 faces_path: Path = DATA_DIR / "faces.json",
+                 face_id_model_path: Path = DATA_DIR / "face_recognition_sface_2021dec.onnx"):
         self.samples_path = samples_path
         self.samples = load_samples(samples_path)
         self.stabilizer = Stabilizer()
@@ -229,7 +267,20 @@ class App:
         self.matcher = ComboMatcher([])
         self.reload_combos()
         self.face_model_path = face_model_path
-        self.face_landmarker = None  # created the first time the mask is used
+        self.face_landmarker = None  # created the first time a face is needed
+        self.face_id_model_path = face_id_model_path
+        self.recognizer: FaceRecognizer | None = None
+        self.facebook = FaceBook(faces_path)
+        self.who: tuple[str, float] | None = None  # (name or "?", similarity)
+        self.recognized_at = 0.0
+        self.seen: dict[str, float] = {}  # name -> last time recognized
+        self.naming: str | None = None  # name being typed for a new face
+        self.enrolling: Enrollment | None = None
+        self.input: InputBackend | None = None
+        self.hand_mouse: HandMouse | None = None
+        self.swipes = SwipeDetector()
+        self.face_gestures = FaceGestureDetector()
+        self.face_top: tuple[int, int, int] | None = None  # x0, y, x1 of the forehead
         self.rasengan_at: float | None = None  # when the current Rasengan started
         self.mask_on = False
         self.banner = ""
@@ -279,6 +330,8 @@ class App:
             self.landmarker.close()
             if self.face_landmarker:
                 self.face_landmarker.close()
+            if self.hand_mouse and self.hand_mouse.pressed and self.input:
+                self.input.run(("release",))
             cv2.destroyAllWindows()
 
     def process(self, frame) -> None:
@@ -289,8 +342,23 @@ class App:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.landmarker.detect_for_video(image, ts)
+        hand_2d = result.hand_landmarks[0] if result.hand_landmarks else None
+
+        face_result = None
+        if self.needs_face():
+            face_result = self.get_face_landmarker().detect_for_video(image, ts)
+        face = face_result.face_landmarks[0] if face_result and face_result.face_landmarks else None
+        # Recognition must see the camera image before anything is drawn on it.
+        self.update_faces(frame, face, now)
+
+        if self.mode == "mouse":
+            self.drive_mouse(hand_2d)
+            self.draw_hand(frame, result)
+            self.prediction = None
+            return
         if self.mode == "jutsu":
-            self.draw_effects(frame, image, ts, result, now)
+            self.jutsu_gestures(hand_2d, face_result, face, now)
+            self.draw_effects(frame, face, result, now)
         else:
             self.draw_hand(frame, result)
 
@@ -325,19 +393,107 @@ class App:
             if combo:
                 self.trigger(combo, now)
 
+    # -- faces --------------------------------------------------------------
+
+    def needs_face(self) -> bool:
+        return (self.mode == "jutsu" or bool(self.facebook.people)
+                or self.enrolling is not None or self.naming is not None)
+
+    def get_face_landmarker(self):
+        if self.face_landmarker is None:
+            path = ensure_model(self.face_model_path, FACE_MODEL_URL, "face model (~4 MB)")
+            self.face_landmarker = create_face_landmarker(path)
+        return self.face_landmarker
+
+    def get_recognizer(self) -> FaceRecognizer:
+        if self.recognizer is None:
+            path = ensure_model(self.face_id_model_path, FACE_ID_MODEL_URL,
+                                "face recognition model (~37 MB)")
+            self.recognizer = FaceRecognizer(path)
+        return self.recognizer
+
+    def update_faces(self, frame, face, now: float) -> None:
+        self.face_top = None
+        if face is None:
+            self.who = None
+            return
+        xs = [p.x for p in face]
+        self.face_top = (int(min(xs) * CAM_W), int(face[10].y * CAM_H), int(max(xs) * CAM_W))
+        enr = self.enrolling
+        if enr:
+            if now - enr.last_at >= 0.25:
+                enr.last_at = now
+                enr.embeddings.append(self.get_recognizer().embed(frame, face))
+                if len(enr.embeddings) >= ENROLL_SAMPLES:
+                    self.facebook.add(enr.name, enr.embeddings)
+                    self.seen[enr.name] = now  # don't greet them right away
+                    self.flash(f"Saved {enr.name}'s face")
+                    self.enrolling = None
+            return
+        if not self.facebook.people or now - self.recognized_at < RECOGNIZE_EVERY_S:
+            return
+        self.recognized_at = now
+        name, score = self.facebook.match(self.get_recognizer().embed(frame, face))
+        self.who = (name or "?", score)
+        if name:
+            if now - self.seen.get(name, -GREET_AFTER_S) >= GREET_AFTER_S:
+                self.greet(name, now)
+            self.seen[name] = now
+
+    def greet(self, name: str, now: float) -> None:
+        self.banner = f"HI, {name.upper()}!"
+        self.banner_until = now + BANNER_S * 1.5
+        speak(f"Hello {name}")
+        for combo in self.matcher.on("arrive", name):
+            self.trigger(combo, now, banner=False)
+
+    # -- controls -----------------------------------------------------------
+
+    def get_input(self) -> InputBackend | None:
+        if self.input is None:
+            try:
+                self.input = InputBackend()
+            except Exception as e:  # noqa: BLE001 - e.g. no display / Wayland
+                self.flash(f"Can't control mouse/keyboard here: {e}", seconds=6)
+        return self.input
+
+    def drive_mouse(self, hand) -> None:
+        backend = self.get_input()
+        if backend is None:
+            return
+        if self.hand_mouse is None:
+            self.hand_mouse = HandMouse(*screen_size())
+        for action in self.hand_mouse.update(hand):
+            backend.run(action)
+
+    def jutsu_gestures(self, hand, face_result, face, now: float) -> None:
+        events = []
+        swipe = self.swipes.update(hand, now)
+        if swipe:
+            events.append(swipe)
+        if face is not None and face_result.face_blendshapes:
+            scores = {c.category_name: c.score for c in face_result.face_blendshapes[0]}
+            events += self.face_gestures.update(scores, head_roll(face), now)
+        else:
+            self.face_gestures.update(None, 0, now)
+        for event in events:
+            for combo in self.matcher.on("gesture", event):
+                self.trigger(combo, now)
+
     # -- jutsu --------------------------------------------------------------
 
     def reload_combos(self) -> None:
         try:
             self.matcher = ComboMatcher(load_combos(self.combos_path))
-            n = len(self.matcher.combos)
+            n = len(self.matcher.all)
             self.flash(f"Loaded {n} combo{'s' * (n != 1)}")
         except (OSError, ValueError) as e:
             self.flash(f"Combos file error: {e}", seconds=8)
 
-    def trigger(self, combo: Combo, now: float) -> None:
-        self.banner = combo.name.upper() + "!"
-        self.banner_until = now + BANNER_S
+    def trigger(self, combo: Combo, now: float, banner: bool = True) -> None:
+        if banner:
+            self.banner = combo.name.upper() + "!"
+            self.banner_until = now + BANNER_S
         try:
             if combo.action == "effect" and combo.target == "rasengan":
                 self.rasengan_at = now
@@ -347,18 +503,16 @@ class App:
                 open_app(combo.target)
             elif combo.action == "url":
                 open_url(combo.target)
+            elif combo.action == "keys":
+                backend = self.get_input()
+                if backend:
+                    backend.keys(parse_keys(combo.target))
         except OSError as e:
             self.flash(f"Couldn't {combo.describe}: {e}", seconds=5)
 
-    def draw_effects(self, frame, image, ts: int, result, now: float) -> None:
-        if self.mask_on:
-            if self.face_landmarker is None:
-                path = ensure_model(self.face_model_path, FACE_MODEL_URL, "face model (~4 MB)")
-                self.face_landmarker = create_face_landmarker(path)
-            faces = self.face_landmarker.detect_for_video(image, ts).face_landmarks
-            if faces:
-                draw_mask(frame, faces[0])
-
+    def draw_effects(self, frame, face, result, now: float) -> None:
+        if self.mask_on and face is not None:
+            draw_mask(frame, face)
         if self.rasengan_at is not None and now - self.rasengan_at > RASENGAN_S:
             self.rasengan_at = None
         if self.rasengan_at is not None and result.hand_landmarks:
@@ -371,6 +525,13 @@ class App:
 
     def handle_key(self, key: int) -> bool:
         """Returns False to quit."""
+        if self.naming is not None:
+            self.type_name(key)
+            return True
+        if key == KEY_ESC and self.enrolling:
+            self.enrolling = None
+            self.flash("Face capture cancelled")
+            return True
         if key == KEY_ESC:
             if self.recording:
                 self.recording = None
@@ -378,10 +539,15 @@ class App:
                 return True
             return False
         if key == KEY_TAB:
+            if self.mode == "mouse" and self.hand_mouse:
+                for action in self.hand_mouse.update(None):  # let go of any drag
+                    self.input.run(action)
             self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
             self.recording = None
             self.stabilizer.reset()
             self.matcher.reset()
+            return True
+        if self.mode == "mouse":
             return True
 
         if self.mode == "jutsu":
@@ -396,6 +562,13 @@ class App:
                     self.flash(f"Couldn't open combos file: {e}", seconds=5)
             elif key in (ord("r"), ord("R")):
                 self.reload_combos()
+            elif key == ord("n"):
+                self.naming = ""
+            elif key == ord("N"):  # Shift+N
+                self.facebook.forget_all()
+                self.seen.clear()
+                self.who = None
+                self.flash("Forgot all faces")
             return True
 
         if self.mode == "read":
@@ -421,6 +594,19 @@ class App:
         elif key in (ord("!"), ord("@")):  # Shift+1 / Shift+2
             self.clear_label(SPACE if key == ord("!") else DELETE)
         return True
+
+    def type_name(self, key: int) -> None:
+        if key == KEY_ESC:
+            self.naming = None
+        elif key in KEY_BACKSPACE:
+            self.naming = self.naming[:-1]
+        elif key in (KEY_ENTER, KEY_RETURN):
+            name = self.naming.strip()
+            self.naming = None
+            if name:
+                self.enrolling = Enrollment(name)
+        elif 32 <= key < 127 and len(self.naming) < 20:
+            self.naming += chr(key)
 
     def start_recording(self, label: str) -> None:
         self.recording = Recording(label, start_at=time.monotonic() + COUNTDOWN_S)
@@ -474,6 +660,11 @@ class App:
             centered(canvas, "Esc to cancel", CAM_W // 2, CAM_H // 2 + 95, 0.5, MUTED, 1)
             return
 
+        self.render_face_tag(canvas)
+        if self.naming is not None or self.enrolling:
+            self.render_enroll(canvas)
+            return
+
         # Prediction badge
         cv2.rectangle(canvas, (12, 12), (232, 84), SURFACE, -1)
         p = self.prediction
@@ -485,13 +676,24 @@ class App:
         else:
             info = "Train first (Tab)"
         cv2.putText(canvas, info, (104, 42), FONT, 0.5, MUTED, 1, cv2.LINE_AA)
+        if self.mode == "mouse":
+            # The part of the camera view that maps onto the whole screen.
+            bx0, by0, bx1, by1 = HandMouse.BOX
+            cv2.rectangle(canvas, (int(bx0 * CAM_W), int(by0 * CAM_H)), (int(bx1 * CAM_W), int(by1 * CAM_H)),
+                          ACCENT_2, 1, cv2.LINE_AA)
+        if self.mode == "mouse" and self.hand_mouse:
+            info = {"idle": "No hand", "point": "Pointing", "pinch": "Click / drag",
+                    "scroll": "Scrolling"}[self.hand_mouse.mode]
+            cv2.rectangle(canvas, (12, 12), (232, 84), SURFACE, -1)
+            cv2.putText(canvas, "MOUSE", (24, 46), FONT, 0.8, ACCENT_2, 2, cv2.LINE_AA)
+            cv2.putText(canvas, info, (24, 72), FONT, 0.5, TEXT, 1, cv2.LINE_AA)
         if self.mode in ("read", "jutsu"):
             bar = int(116 * self.stabilizer.progress(now))
             cv2.rectangle(canvas, (104, 56), (220, 64), SURFACE_2, -1)
             if bar:
                 cv2.rectangle(canvas, (104, 56), (104 + bar, 64), ACCENT_2, -1)
 
-        if self.mode == "jutsu" and now < self.banner_until:
+        if now < self.banner_until:
             # Pop in large, then settle.
             age = 1 - (self.banner_until - now) / BANNER_S
             scale = 1.6 + 0.6 * max(0.0, 1 - age * 4)
@@ -502,6 +704,38 @@ class App:
             (w, _), _ = cv2.getTextSize(self.message, FONT, 0.6, 1)
             cv2.rectangle(canvas, (12, CAM_H - 46), (36 + w, CAM_H - 12), SURFACE, -1)
             cv2.putText(canvas, self.message, (24, CAM_H - 22), FONT, 0.6, TEXT, 1, cv2.LINE_AA)
+
+    def render_face_tag(self, canvas) -> None:
+        if not self.who or not self.face_top:
+            return
+        name, score = self.who
+        x0, y, x1 = self.face_top
+        label = name if name != "?" else "Unknown"
+        color = GREEN if name != "?" else MUTED
+        (w, h), _ = cv2.getTextSize(label, FONT, 0.65, 2)
+        cx = (x0 + x1) // 2
+        top = max(4, y - 40)
+        cv2.rectangle(canvas, (cx - w // 2 - 10, top), (cx + w // 2 + 10, top + h + 14), SURFACE, -1)
+        cv2.rectangle(canvas, (cx - w // 2 - 10, top), (cx + w // 2 + 10, top + h + 14), color, 1)
+        cv2.putText(canvas, label, (cx - w // 2, top + h + 6), FONT, 0.65, color, 2, cv2.LINE_AA)
+
+    def render_enroll(self, canvas) -> None:
+        cv2.rectangle(canvas, (60, 150), (CAM_W - 60, 300), SURFACE, -1)
+        cv2.rectangle(canvas, (60, 150), (CAM_W - 60, 300), ACCENT, 1)
+        if self.naming is not None:
+            cv2.putText(canvas, "New face: type a name, then Enter", (80, 185), FONT, 0.6, TEXT, 1, cv2.LINE_AA)
+            cursor = "_" if int(time.monotonic() * 2) % 2 else " "
+            cv2.putText(canvas, self.naming + cursor, (80, 240), FONT, 1.1, ACCENT_2, 2, cv2.LINE_AA)
+            cv2.putText(canvas, "Esc to cancel", (80, 280), FONT, 0.5, MUTED, 1, cv2.LINE_AA)
+        else:
+            enr = self.enrolling
+            cv2.putText(canvas, f"Learning {enr.name}'s face...", (80, 190), FONT, 0.7, TEXT, 2, cv2.LINE_AA)
+            msg = "Look at the camera, turn your head a little" if self.face_top else "No face in view"
+            cv2.putText(canvas, msg, (80, 225), FONT, 0.55, MUTED, 1, cv2.LINE_AA)
+            done = len(enr.embeddings) / ENROLL_SAMPLES
+            cv2.rectangle(canvas, (80, 250), (CAM_W - 80, 262), SURFACE_2, -1)
+            cv2.rectangle(canvas, (80, 250), (80 + int((CAM_W - 160) * done), 262), GREEN, -1)
+            cv2.putText(canvas, "Esc to cancel", (80, 288), FONT, 0.5, MUTED, 1, cv2.LINE_AA)
 
     def render_panel(self, canvas, x0, now) -> None:
         x = x0 + 20
@@ -519,6 +753,25 @@ class App:
         cell, gap, top = 42, 4, 82
         if self.mode == "jutsu":
             self.render_combos(canvas, x, top, now)
+            return
+        if self.mode == "mouse":
+            lines = [
+                "Your hand is the mouse:",
+                "",
+                "Point            move the cursor",
+                "Pinch thumb+index  click",
+                "Pinch and move   drag",
+                "Index+middle up  scroll (move up/down)",
+                "",
+                "Keep your hand in the middle of",
+                "the camera view; the edges of the",
+                "box map to the edges of the screen.",
+                "",
+                "To stop: click this window, press Tab.",
+            ]
+            for i, line in enumerate(lines):
+                cv2.putText(canvas, line, (x, top + 14 + i * 24), FONT, 0.47,
+                            TEXT if i == 0 else MUTED, 1, cv2.LINE_AA)
             return
 
         # Letter grid: 7 columns, a dot marks trained signs.
@@ -560,35 +813,45 @@ class App:
 
     def render_combos(self, canvas, x, top, now) -> None:
         progress = self.matcher.progress(now)
-        y = top + 4
-        if not self.matcher.combos:
-            cv2.putText(canvas, "No combos. Press E to edit.", (x, y + 14), FONT, 0.5, MUTED, 1, cv2.LINE_AA)
-        for combo in self.matcher.combos[:6]:
-            done = progress.get(combo.name, 0)
-            cv2.putText(canvas, combo.name, (x, y + 14), FONT, 0.55, TEXT, 1, cv2.LINE_AA)
+        y = top
+        if not self.matcher.all:
+            cv2.putText(canvas, "No combos. Press E to edit.", (x, y + 18), FONT, 0.5, MUTED, 1, cv2.LINE_AA)
+        for combo in self.matcher.all[:9]:
             sx = x
-            for i, sign in enumerate(combo.signs):
-                label = short(sign)
-                (w, _), _ = cv2.getTextSize(label, FONT, 0.5, 1)
-                color = ACCENT_2 if i < done else (MUTED if self.samples.get(sign) else RED)
-                cv2.rectangle(canvas, (sx, y + 22), (sx + w + 12, y + 44), SURFACE_2, -1)
-                cv2.putText(canvas, label, (sx + 6, y + 39), FONT, 0.5, color, 1, cv2.LINE_AA)
-                sx += w + 18
-            cv2.putText(canvas, combo.describe, (sx + 4, y + 39), FONT, 0.42, MUTED, 1, cv2.LINE_AA)
-            y += 56
+            if combo.trigger == "signs":
+                done = progress.get(combo.name, 0)
+                chips = [(short(sg), ACCENT_2 if i < done else (TEXT if self.samples.get(sg) else RED))
+                         for i, sg in enumerate(combo.signs)]
+            elif combo.trigger == "gesture":
+                chips = [(combo.when[0].replace("_", " "), TEXT)]
+            else:
+                chips = [(f"sees {combo.when[0]}", GREEN)]
+            for label, color in chips:
+                (w, _), _ = cv2.getTextSize(label, FONT, 0.42, 1)
+                cv2.rectangle(canvas, (sx, y + 4), (sx + w + 10, y + 24), SURFACE_2, -1)
+                cv2.putText(canvas, label, (sx + 5, y + 19), FONT, 0.42, color, 1, cv2.LINE_AA)
+                sx += w + 14
+            cv2.putText(canvas, combo.name, (max(sx + 4, x + 140), y + 19), FONT, 0.45, MUTED, 1, cv2.LINE_AA)
+            y += 26
+        people = ", ".join(self.facebook.people) or "nobody yet"
         lines = [
-            "Sign each seal in order (3s apart max).",
-            "Red seal = not trained yet.",
+            f"Faces: {people}"[:44],
+            "N  add face   Shift+N  forget faces",
             "X  clear effects   E  edit combos",
             "R  reload combos   Tab  next mode",
         ]
-        y = max(y + 6, 300)
+        y = max(y + 12, 340)
         for i, line in enumerate(lines):
             cv2.putText(canvas, line, (x, y + i * 22), FONT, 0.45, MUTED, 1, cv2.LINE_AA)
 
     def render_transcript(self, canvas, y0) -> None:
         cv2.rectangle(canvas, (0, y0), (CAM_W + PANEL_W, y0 + TEXT_H), SURFACE, -1)
         cv2.line(canvas, (0, y0), (CAM_W + PANEL_W, y0), BORDER, 1)
+        if self.mode == "mouse":
+            cv2.putText(canvas, "MOUSE CONTROL", (20, y0 + 28), FONT, 0.45, MUTED, 1, cv2.LINE_AA)
+            cv2.putText(canvas, "Your hand controls the mouse. Click here + Tab to stop.",
+                        (20, y0 + 78), FONT, 0.75, TEXT, 1, cv2.LINE_AA)
+            return
         if self.mode == "jutsu":
             cv2.putText(canvas, "SEALS", (20, y0 + 28), FONT, 0.45, MUTED, 1, cv2.LINE_AA)
             seals = "  >  ".join(short(s) for s, _ in self.matcher.history)
@@ -621,6 +884,11 @@ def main(argv=None) -> None:
                         help="MediaPipe hand model; downloaded on first run if missing")
     parser.add_argument("--face-model", type=Path, default=default_model_path("face_landmarker.task"),
                         help="MediaPipe face model for the mask effect; downloaded when first needed")
+    parser.add_argument("--face-id-model", type=Path,
+                        default=default_model_path("face_recognition_sface_2021dec.onnx"),
+                        help="OpenCV SFace face recognition model; downloaded when first needed")
+    parser.add_argument("--faces", type=Path, default=DATA_DIR / "faces.json",
+                        help="where registered faces are stored (default ~/.sign_reader/faces.json)")
     parser.add_argument("--combos", type=Path, default=DATA_DIR / "combos.json",
                         help="hand-seal combos for jutsu mode (created with defaults if missing)")
     parser.add_argument("--self-test", action="store_true",
@@ -628,9 +896,11 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     model = ensure_model(args.model)
     if args.self_test:
-        self_test(model, ensure_model(args.face_model, FACE_MODEL_URL, "face model (~4 MB)"))
+        self_test(model, ensure_model(args.face_model, FACE_MODEL_URL, "face model (~4 MB)"),
+                  ensure_model(args.face_id_model, FACE_ID_MODEL_URL, "face recognition model (~37 MB)"))
         return
-    App(args.camera, args.samples, model, args.face_model, args.combos).run()
+    App(args.camera, args.samples, model, args.face_model, args.combos,
+        args.faces, args.face_id_model).run()
 
 
 if __name__ == "__main__":

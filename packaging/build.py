@@ -16,9 +16,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
-from sign_reader.app import FACE_MODEL_URL, MODEL_URL  # noqa: E402
+from sign_reader.app import FACE_ID_MODEL_URL, FACE_MODEL_URL, MODEL_URL  # noqa: E402
 
-for name, url in (("hand_landmarker.task", MODEL_URL), ("face_landmarker.task", FACE_MODEL_URL)):
+for name, url in (
+    ("hand_landmarker.task", MODEL_URL),
+    ("face_landmarker.task", FACE_MODEL_URL),
+    ("face_recognition_sface_2021dec.onnx", FACE_ID_MODEL_URL),
+):
     model = HERE / "assets" / name
     if not model.exists():
         model.parent.mkdir(exist_ok=True)

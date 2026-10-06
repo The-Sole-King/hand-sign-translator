@@ -12,7 +12,7 @@ Download the build for your computer from the repo's **Actions** tab (open the l
 | macOS (Apple Silicon) | `SignReader-macos.zip` | Unzip, drag **SignReader.app** to Applications, then **right-click → Open** the first time (the app isn't signed by Apple). Allow camera access when asked. |
 | Linux | `SignReader-linux.tar.gz` | Extract and double-click **SignReader** (or run `./SignReader`). |
 
-The hand and face models are built in, so the app works offline (except for opening websites). It takes a few seconds to start because it unpacks itself.
+All models are built in, so the app works offline (except for opening websites). It takes a few seconds to start because it unpacks itself.
 
 ## Run from source
 
@@ -58,7 +58,7 @@ It learns from **your** hands, so train it first:
 | Space / Backspace | Edit the text by keyboard |
 | Enter | Read the text aloud |
 | C | Clear the text |
-| Tab / Esc | Next mode (read → train → jutsu) / quit |
+| Tab / Esc | Next mode (read → train → jutsu → mouse) / quit |
 
 Samples are saved to `~/.sign_reader/samples.json` after each recording. Copy that file to back up your training or move it to another computer.
 
@@ -96,6 +96,54 @@ Press **E** in jutsu mode to open `~/.sign_reader/combos.json`, edit it, save it
 
 Combos can be any length. If one combo is the end of another (`B C` and `A B C`), the longer one wins when you sign it.
 
+## Mouse mode: control the computer with your hand
+
+Press **Tab** until the panel says **MOUSE**. The yellow box on the camera view is your "screen": move your hand inside it.
+
+| Hand | Does |
+|---|---|
+| Point (thumb and index apart) | Moves the cursor |
+| Pinch thumb + index | Click |
+| Pinch, move, open | Drag |
+| Index + middle finger up, others folded | Scroll: move your hand up/down |
+
+To stop, click the Sign Reader window and press **Tab**.
+
+## Gestures
+
+In **JUTSU** mode, combos can also be triggered by hand swipes and your face, and can press keys. These are in the default `combos.json`:
+
+| Gesture | Default action |
+|---|---|
+| Swipe right / left | → / ← arrow keys (next / previous slide, photo, …) |
+| Swipe up / down | Volume up / down |
+| Open your mouth (hold it) | Play / pause media |
+| Raise your eyebrows | Mute |
+
+Other gestures you can use: `smile`, `long_blink` (close both eyes ~1 s), `head_tilt_left`, `head_tilt_right`.
+
+`keys` can be any shortcut: `"ctrl+c"`, `"alt+tab"`, `"win+d"`, `"ctrl+shift+t"`, `"f5"`, `"space"`, and media keys `play_pause`, `next_track`, `prev_track`, `volume_up`, `volume_down`, `mute`.
+
+```json
+{"name": "Next song", "gesture": "head_tilt_right", "keys": "next_track"},
+{"name": "Copy",      "signs": ["C", "C"],          "keys": "ctrl+c"}
+```
+
+## Face recognition
+
+The app can learn who you are, put your name over your face, and greet you.
+
+1. In **JUTSU** mode press **N**, type your name, press **Enter**.
+2. Look at the camera for 2 seconds while it learns your face (turn your head slightly).
+
+From then on, in every mode, it labels you (strangers show as *Unknown*) and says "Hello, *name*" when you come back after being away for a minute. You can also run actions when someone arrives:
+
+```json
+{"name": "Morning", "arrive": "Rushd", "url": "https://calendar.google.com"}
+```
+
+**Shift+N** forgets every face. Faces are stored as numbers (not photos) in `~/.sign_reader/faces.json` and never leave your computer. Recognition uses OpenCV's [SFace](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) model, which is good for "which of the people I know is this?", not for security. Don't use it to lock anything important.
+
 ## How it works
 
 1. **Hand tracking**: [MediaPipe Hand Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker) finds 21 3-D points on the hand in each frame.
@@ -109,6 +157,8 @@ Combos can be any length. If one combo is the end of another (`B C` and `A B C`)
 | `sign_reader/app.py` | Camera, MediaPipe, window and keyboard controls |
 | `sign_reader/jutsu.py` | Combo file format and sequence matching. No camera or GUI code |
 | `sign_reader/effects.py` | Rasengan and mask drawing, launching apps and URLs |
+| `sign_reader/controls.py` | Hand mouse, swipes, face gestures, pressing keys |
+| `sign_reader/faces.py` | Face recognition and the saved faces |
 | `tests/test_core.py` | Unit tests: `python -m unittest discover -s tests` |
 | `packaging/` | PyInstaller spec and build script for the double-click app |
 

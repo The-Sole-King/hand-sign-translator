@@ -1,2 +1,3 @@
 mediapipe>=1.0  # also installs OpenCV (opencv-contrib-python)
 numpy>=1.24
+pynput>=1.7  # mouse and keyboard control
