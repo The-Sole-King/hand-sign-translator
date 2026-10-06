@@ -37,6 +37,8 @@ MODEL_URL = (
     "hand_landmarker/float16/1/hand_landmarker.task"
 )
 DATA_DIR = Path.home() / ".sign_reader"
+# Set when running as a PyInstaller-built app; bundled files live under it.
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else None
 SAMPLES_PER_RECORDING = 30
 SAMPLE_INTERVAL_S = 0.08
 COUNTDOWN_S = 3.0
@@ -68,21 +70,70 @@ def short(label: str) -> str:
     return {SPACE: "SPC", DELETE: "DEL"}.get(label, label)
 
 
+def log(message: str) -> None:
+    # A windowed app on Windows has no console, so stdout can be None.
+    if sys.stdout:
+        print(message, flush=True)
+
+
+def fail(message: str) -> None:
+    """Report a fatal error and exit, with a dialog when there's no terminal."""
+    log(message)
+    if BUNDLE_DIR is not None:
+        try:
+            import tkinter
+            from tkinter import messagebox
+
+            root = tkinter.Tk()
+            root.withdraw()
+            messagebox.showerror(WINDOW, message)
+            root.destroy()
+        except Exception:  # noqa: BLE001 - the message was already logged
+            pass
+    sys.exit(1)
+
+
+def default_model_path() -> Path:
+    if BUNDLE_DIR is not None:
+        bundled = BUNDLE_DIR / "assets" / "hand_landmarker.task"
+        if bundled.exists():
+            return bundled
+    return DATA_DIR / "hand_landmarker.task"
+
+
 def ensure_model(path: Path) -> Path:
     if path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading hand model (~8 MB) to {path} ...")
+    log(f"Downloading hand model (~8 MB) to {path} ...")
     try:
         tmp = path.with_suffix(".part")
         urllib.request.urlretrieve(MODEL_URL, tmp)
         tmp.replace(path)
     except Exception as e:  # noqa: BLE001 - surface any network error plainly
-        sys.exit(
-            f"Couldn't download the hand model: {e}\n"
-            f"Download it manually from\n  {MODEL_URL}\nand save it as\n  {path}"
+        fail(
+            f"Couldn't download the hand model: {e}\n\n"
+            f"Download it manually from\n{MODEL_URL}\nand save it as\n{path}"
         )
     return path
+
+
+def create_landmarker(model_path: Path):
+    options = vision.HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+    )
+    return vision.HandLandmarker.create_from_options(options)
+
+
+def self_test(model_path: Path) -> None:
+    """Load the model and run one detection, for checking a packaged build."""
+    with create_landmarker(model_path) as landmarker:
+        blank = np.zeros((CAM_H, CAM_W, 3), np.uint8)
+        result = landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=blank), 0)
+    assert not result.hand_landmarks
+    log("self-test ok")
 
 
 def speak(text: str) -> None:
@@ -103,13 +154,19 @@ def speak(text: str) -> None:
     else:
         tool = shutil.which("spd-say") or shutil.which("espeak-ng") or shutil.which("espeak")
         if not tool:
-            print("Text-to-speech needs spd-say or espeak on Linux.")
+            log("Text-to-speech needs spd-say or espeak on Linux.")
             return
         cmd = [tool, text]
     try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # Don't flash a PowerShell window on Windows.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except OSError as e:
-        print(f"Couldn't speak: {e}")
+        log(f"Couldn't speak: {e}")
 
 
 @dataclass
@@ -132,21 +189,17 @@ class App:
         self.message = ""
         self.message_until = 0.0
 
+        self.landmarker = create_landmarker(model_path)
         self.cap = cv2.VideoCapture(camera)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
         if not self.cap.isOpened():
-            sys.exit(
-                f"Couldn't open camera {camera}. Check it's connected, not in use by "
-                "another app, and that this terminal has camera permission."
+            self.landmarker.close()
+            fail(
+                f"Couldn't open camera {camera}.\n\nCheck it's connected, not in use by "
+                "another app, and that Sign Reader is allowed to use the camera "
+                "(macOS: System Settings > Privacy & Security > Camera)."
             )
-
-        options = vision.HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
-        )
-        self.landmarker = vision.HandLandmarker.create_from_options(options)
         self.connections = vision.HandLandmarksConnections.HAND_CONNECTIONS
         self.t0 = time.monotonic()
         self.last_ts = -1
@@ -402,10 +455,16 @@ def main(argv=None) -> None:
     parser.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
     parser.add_argument("--samples", type=Path, default=DATA_DIR / "samples.json",
                         help="where trained samples are stored (default ~/.sign_reader/samples.json)")
-    parser.add_argument("--model", type=Path, default=DATA_DIR / "hand_landmarker.task",
+    parser.add_argument("--model", type=Path, default=default_model_path(),
                         help="MediaPipe hand model; downloaded on first run if missing")
+    parser.add_argument("--self-test", action="store_true",
+                        help="load the model, run one detection and exit (checks a build)")
     args = parser.parse_args(argv)
-    App(args.camera, args.samples, ensure_model(args.model)).run()
+    model = ensure_model(args.model)
+    if args.self_test:
+        self_test(model)
+        return
+    App(args.camera, args.samples, model).run()
 
 
 if __name__ == "__main__":

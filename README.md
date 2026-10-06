@@ -2,7 +2,19 @@
 
 A desktop program that reads **ASL fingerspelling** from your webcam and types it out. Everything runs locally on your computer, and no video is uploaded anywhere.
 
-## Install
+## Get the app (double-click)
+
+Download the build for your computer from the repo's **Actions** tab (open the latest *Sign Reader app* run and scroll to **Artifacts**), or from **Releases** once a version has been published:
+
+| OS | File | Open it |
+|---|---|---|
+| Windows | `SignReader-windows.zip` | Unzip and double-click **SignReader.exe**. The first time, Windows SmartScreen may say "Windows protected your PC": click **More info → Run anyway**. |
+| macOS (Apple Silicon) | `SignReader-macos.zip` | Unzip, drag **SignReader.app** to Applications, then **right-click → Open** the first time (the app isn't signed by Apple). Allow camera access when asked. |
+| Linux | `SignReader-linux.tar.gz` | Extract and double-click **SignReader** (or run `./SignReader`). |
+
+The hand model is built in, so the app works offline. It takes a few seconds to start because it unpacks itself.
+
+## Run from source
 
 Needs Python 3.9+ and a webcam.
 
@@ -11,16 +23,22 @@ cd sign-reader
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## Run
-
-```bash
 python -m sign_reader
 ```
 
 On first launch it downloads MediaPipe's hand model (~8 MB) into `~/.sign_reader/`.
 Options: `--camera 1` to use a different camera, `--samples path.json` to use a different set of trained samples.
+
+## Build the app yourself
+
+Each OS has to build its own app:
+
+```bash
+pip install -r requirements.txt pyinstaller
+python packaging/build.py
+```
+
+The result is in `dist/`: `SignReader.exe` on Windows, `SignReader.app` on macOS, `SignReader` on Linux. `dist/SignReader… --self-test` checks that the build can load the model. The [GitHub Actions workflow](../.github/workflows/sign-reader.yml) does this on all three OSes on every push to `sign-reader/`. Pushing a tag like `sign-reader-v1.0.0` publishes the builds as a Release.
 
 ## Use it
 
@@ -57,6 +75,7 @@ Samples are saved to `~/.sign_reader/samples.json` after each recording. Copy th
 | `sign_reader/core.py` | Features, classifier, debouncing, saving. No camera or GUI code |
 | `sign_reader/app.py` | Camera, MediaPipe, window and keyboard controls |
 | `tests/test_core.py` | Unit tests: `python -m unittest discover -s tests` |
+| `packaging/` | PyInstaller spec and build script for the double-click app |
 
 Text-to-speech uses the system voice: `say` on macOS, built-in speech on Windows, and `spd-say` or `espeak` on Linux.
 

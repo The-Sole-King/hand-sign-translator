@@ -1,0 +1,47 @@
+# PyInstaller spec: builds a double-click app for the current OS.
+#   Windows -> dist/SignReader.exe     macOS -> dist/SignReader.app
+#   Linux   -> dist/SignReader
+# Run via `python packaging/build.py`, which downloads the hand model first.
+import sys
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+
+HERE = Path(SPECPATH)
+ROOT = HERE.parent
+MODEL = HERE / "assets" / "hand_landmarker.task"
+if not MODEL.exists():
+    raise SystemExit(f"Missing {MODEL}. Run packaging/build.py instead of pyinstaller directly.")
+
+a = Analysis(
+    [str(HERE / "launcher.py")],
+    pathex=[str(ROOT)],
+    # MediaPipe loads its native library from mediapipe/tasks/c via ctypes,
+    # which PyInstaller can't see, so collect it (and its data) explicitly.
+    binaries=collect_dynamic_libs("mediapipe"),
+    datas=collect_data_files("mediapipe") + [(str(MODEL), "assets")],
+    hiddenimports=collect_submodules("mediapipe.tasks.python"),
+    excludes=["pytest", "IPython"],
+)
+pyz = PYZ(a.pure)
+
+if sys.platform == "darwin":
+    # A .app bundle: onedir layout, launched from Finder.
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="SignReader",
+              console=False, argv_emulation=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name="SignReader")
+    app = BUNDLE(
+        coll,
+        name="SignReader.app",
+        bundle_identifier="com.thesoleking.signreader",
+        info_plist={
+            "CFBundleDisplayName": "Sign Reader",
+            "CFBundleShortVersionString": "1.0.0",
+            "NSCameraUsageDescription": "Sign Reader uses the camera to read your hand signs. Video never leaves your computer.",
+            "NSHighResolutionCapable": True,
+        },
+    )
+else:
+    # A single self-contained executable.
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="SignReader",
+              console=False, upx=False)
