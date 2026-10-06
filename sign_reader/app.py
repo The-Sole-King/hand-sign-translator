@@ -120,7 +120,11 @@ def ensure_model(path: Path) -> Path:
 
 def create_landmarker(model_path: Path):
     options = vision.HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(model_path)),
+        # CPU is plenty for one hand, and avoids MediaPipe's macOS Metal path,
+        # which aborts on machines without full GPU access.
+        base_options=BaseOptions(
+            model_asset_path=str(model_path), delegate=BaseOptions.Delegate.CPU
+        ),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=1,
     )
